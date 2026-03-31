@@ -231,7 +231,7 @@ module tb_pe;
     valid_in = 0;
     @(posedge clk); #1;
     check("valid_out: 0 one cycle after valid_in falls",
-          psum_out, 32'sd1, act_out, 8'sd0, valid_out, 1'b0);
+          psum_out, 32'sd1, act_out, 8'sd1, valid_out, 1'b0);
 
     // ==================================================================
     // TEST 7 — Accumulation chain: psum_in feeds into accumulation

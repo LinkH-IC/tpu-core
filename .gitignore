@@ -1,0 +1,13 @@
+
+**/__pycache__/
+
+
+*.vcd
+
+
+**/sim_build/
+**/results.xml
+**/sim.log
+
+
+**/obj_dir/

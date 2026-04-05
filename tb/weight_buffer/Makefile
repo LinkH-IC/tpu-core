@@ -17,3 +17,7 @@ MODULE   = tb_weight_buffer
 EXTRA_ARGS += --timing --trace -Wall -Wno-DECLFILENAME
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
+
+# Clean rule
+clean::
+	rm -rf sim_build results.xml __pycache__ dump.vcd

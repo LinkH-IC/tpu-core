@@ -22,7 +22,7 @@ rtl/
   systolic_array.sv   ⬜ Not started
   weight_buffer.sv    ⬜ Not started
   activation_buffer.sv⬜ Not started
-  accmulator.sv       ⬜ Not started
+  accumulator.sv      ⬜ Not started
   control_fsm.sv      ⬜ Not started
   top.sv              ⬜ Not started
 tb/
@@ -101,7 +101,7 @@ rtl/
   systolic_array.sv   ⬜ Not started ← Next session
   weight_buffer.sv    ⬜ Not started
   activation_buffer.sv⬜ Not started
-  accmulator.sv       ⬜ Not started
+  accumulator.sv      ⬜ Not started
   control_fsm.sv      ⬜ Not started
   top.sv              ⬜ Not started
 tb/
@@ -179,7 +179,7 @@ rtl/
   systolic_array.sv   ✅ Complete
   weight_buffer.sv    ⬜ Not started
   activation_buffer.sv⬜ Not started
-  accmulator.sv       ⬜ Not started
+  accumulator.sv      ⬜ Not started
   control_fsm.sv      ⬜ Not started
   top.sv              ⬜ Not started
 tb/
@@ -244,7 +244,7 @@ rtl/
   systolic_array.sv   ✅ Complete
   weight_buffer.sv    ⬜ Not started
   activation_buffer.sv⬜ Not started
-  accmulator.sv       ⬜ Not started
+  accumulator.sv      ⬜ Not started
   control_fsm.sv      ⬜ Not started
   top.sv              ⬜ Not started
 tb/
@@ -540,15 +540,125 @@ tb/
 
 ---
 
-## Session 9 — TODO
+## Session 9 — 2026-03-31 - 2026-04-03
 
-Next module: **Output Buffer** (`accumulator.sv`)
+### What We Did
 
-Design questions to resolve:
-- Output capture register vs multi-pass accumulator — what does our 8×8 array actually need?
-- How to handle column stagger in result capture (each column's valid arrives one cycle apart)?
-- Interface to host: how does the FSM or host read the captured results?
-- Keep in mind: output buffer feeds ReLU unit, which feeds back into activation buffer write mux
+1. **Clarified accumulator purpose from the TPU paper:**
+   - The accumulator is not just an output capture register — it performs genuine partial sum accumulation across tiling passes when the inner matrix dimension exceeds the array size (8 for us, 256 for Google)
+   - The MatrixMultiply instruction in the real TPU includes an accumulator address; same address = accumulate, new address = fresh write
+   - Without multi-pass support, matrices larger than 8×8 cannot be computed — accumulation is essential for generality
+
+2. **Designed and wrote `accumulator.sv`:**
+   - 8×8 × 32-bit register file storing intermediate/final results
+   - Per-column row counters: each column independently tracks which result row it is writing to, handling the staggered wavefront from the systolic array
+   - `clear` signal (distinct from `rst_n`): zeroes registers before a new matmul without resetting the entire system. Buffers don't need this because they use store semantics (overwrite); the accumulator uses accumulate semantics (additive)
+   - `pass_done` with auto-reset: pulses when all 8 columns complete one pass, resets counters but preserves accumulated values for the next tiling pass
+   - Drain sequencer: outputs one **column** per cycle (not row), matching the unified buffer's column-oriented write port
+   - `col_idx` output maps directly to unified buffer `wr_addr` during writeback
+
+3. **Designed and wrote `relu.sv`:**
+   - Pure combinational module, no clock — sits between accumulator drain and unified buffer write port
+   - Three operations per element: ReLU (clip negatives to 0), scale (configurable right-shift for requantization), clamp (saturate to signed INT8 [0, 127])
+   - `shift_amount` is set by the host per layer based on training-time quantization — compresses 32-bit accumulator values back to 8-bit for the next layer
+   - Parameterized by ROWS (processes all rows of one column per cycle)
+
+4. **Evolved `activation_buffer.sv` into `unified_buffer.sv`:**
+   - Three banks: **write bank** (was shadow), **active bank** (unchanged), **result bank** (new)
+   - Write bank: staging area for incoming data from host or ReLU feedback (mux lives in top.sv)
+   - Active bank: copied from write bank on `load_trigger`, sequencer streams to array
+   - Result bank: copied from write bank on `store_trigger`, host reads via `rd_addr`/`rd_en`/`rd_data`
+   - FSM expanded: IDLE → COPY → STREAM → IDLE (existing), IDLE → STORE → IDLE (new)
+   - `load_trigger` takes priority over `store_trigger` if both arrive simultaneously
+   - `ready` blocks writes during both COPY and STORE states
+   - Host read port is **registered** (one-cycle latency) to avoid glitches
+   - `rd_data` driven to zero when `rd_en` is low to save power
+   - Renamed: `done` → `load_done`, parallel with `store_done`
+
+5. **Fixed accumulator drain orientation:**
+   - Original design drained row-by-row, but unified buffer writes column-by-column — dimensional mismatch
+   - Changed drain to column-by-column: `acc_out[r] = acc_reg[r][drain_cnt]` — all rows for one column
+   - `row_idx` → `col_idx`, which maps directly to `wr_addr` during writeback
+   - ReLU parameter changed from `COLS` to `ROWS` to match the new orientation
+
+6. **Wrote and verified all testbenches:**
+   - `tb_accumulator.py` — 9 tests: reset, clear, single-pass aligned/staggered, drain sequencing, pass_done timing, multi-pass accumulation, done timing, back-to-back
+   - `tb_relu.sv` — 9 tests: zeros, positive passthrough, negative clipping, mixed, shift scaling, saturation, boundary, max shift, per-row independence
+   - `tb_unified_buffer.py` — 14 tests: all 9 original activation buffer tests adapted + store/read, store_done timing, result bank isolation, read gating, full pipeline end-to-end
+
+### Architecture Decisions
+
+| Parameter | Decision |
+|---|---|
+| Accumulator size | 8×8 × 32-bit register file (full output matrix) |
+| Accumulator operation | `acc_reg[row][col] += psum_in[col]` with per-column row counters |
+| Clear vs reset | `clear` zeroes data registers only; `rst_n` resets entire module including FSM |
+| Pass tracking | `col_done` packed vector, `pass_done = &col_done`, auto-reset on pulse |
+| Drain orientation | Column-by-column (matches unified buffer write port) |
+| ReLU style | Pure combinational: clip → shift → clamp |
+| Requantization | Configurable right-shift (`shift_amount[4:0]`), set by host per layer |
+| Unified buffer banks | Write (staging), Active (array feed), Result (host readback) |
+| Result bank population | Single-cycle copy from write bank on `store_trigger` |
+| Host read port | Registered, gated by `rd_en` |
+| Write port mux location | External, in top.sv — buffer is source-agnostic |
+| Port style | All `logic` (aligned with pe.sv) |
+
+### Key Learnings
+
+- **Store vs accumulate semantics:** Buffers naturally overwrite old data (store), so they don't need a clear signal. The accumulator adds to existing values (accumulate), so stale data corrupts results without explicit clearing.
+- **Drain orientation must match consumer:** The accumulator drain must output in the same orientation the downstream write port expects. Column-wise drain → column-wise write — no transpose buffer needed.
+- **Neural network outputs are not always 1D:** But the hardware doesn't care — it always produces 8×8 tiles. The host knows which entries are padding and ignores them.
+- **General-purpose design:** Any matrix multiply decomposes into 8×8 tiles. The accumulator handles inner-dimension tiling, the FSM handles outer loops, the host handles padding. No hardware changes needed for different matrix sizes.
+- **`final` is a SystemVerilog keyword:** cannot be used as a signal/variable name.
+
+### Repo Status
+
+```
+rtl/
+  pe.sv                 ✅ Complete + verified
+  systolic_array.sv     ✅ Complete + verified
+  weight_buffer.sv      ✅ Complete + verified
+  unified_buffer.sv     ✅ Complete + verified (14 tests pass) — replaces activation_buffer.sv
+  accumulator.sv        ✅ Complete + verified (9 tests pass)
+  relu.sv               ✅ Complete + verified (9 tests pass)
+  control_fsm.sv        ⬜ Not started          ← Next
+  top.sv                ⬜ Not started
+tb/
+  pe/
+    tb_pe.sv                ✅ Complete
+  systolic_array/
+    tb_systolic_array.py    ✅ Complete
+    Makefile
+  weight_buffer/
+    tb_weight_buffer.py     ✅ Complete
+    Makefile
+  unified_buffer/
+    tb_unified_buffer.py    ✅ Complete — ALL 14 TESTS PASS
+    Makefile
+  accumulator/
+    tb_accumulator.py       ✅ Complete — ALL 9 TESTS PASS
+    Makefile
+  relu/
+    tb_relu.sv              ✅ Complete — ALL 9 TESTS PASS
+```
+---
+
+## Session 11 — TODO
+
+Next module: **Control FSM** (`control_fsm.sv`)
+
+Design questions resolved so far:
+- **Host-stepped FSM:** FSM executes one phase at a time, returns to idle, waits for host command. No internal layer/tiling loop — host controls the sequence.
+- **Handoff boundary:** Host owns the write ports during loading. Host asserts `start` after loading is complete. FSM takes over datapath during computation and feedback.
+- **Write port mux:** Separate small module in top.sv, selects host vs ReLU feedback based on FSM phase.
+- **Drain-to-writeback wiring:** `col_idx` → `wr_addr`, `relu_out` → `wr_data`, `acc_valid` → `wr_en` — FSM bridges accumulator drain to unified buffer write port.
+
+Open questions for next session:
+- Exact FSM state list and transitions
+- Host interface signals: what commands does the host send? Configuration registers for `shift_amount`, tiling count?
+- Status signals back to host: computation complete, drain complete, results ready?
+- Write port mux module design
+- How does `store_trigger` get asserted — by FSM or host directly?
 
 ---
 

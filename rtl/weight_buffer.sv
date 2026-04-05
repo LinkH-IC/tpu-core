@@ -5,16 +5,16 @@ module weight_buffer #(
     parameter COLS   = 8,
     parameter DATA_W = 8
 )(
-    input  wire                             clk,
-    input  wire                             rst_n,
+    input  logic                            clk,
+    input  logic                            rst_n,
 
     // Host write interface (shadow bank)
-    input  wire  [2:0]                      wr_addr,    // Column index 0–7
-    input  wire  [ROWS-1:0][DATA_W-1:0]     wr_data,    // All 8 row weights for one column
-    input  wire                             wr_en,
+    input  logic  [2:0]                     wr_addr,    // Column index 0–7
+    input  logic  [ROWS-1:0][DATA_W-1:0]    wr_data,    // All 8 row weights for one column
+    input  logic                            wr_en,
 
     // Control interface
-    input  wire                             load_trigger,   // Strobe: copy + sequence
+    input  logic                            load_trigger,   // Strobe: copy + sequence
     output logic                            ready,          // Shadow bank writable
     output logic                            done,           // Pulse: array loaded
 

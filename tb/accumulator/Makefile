@@ -1,19 +1,23 @@
 # =============================================================================
-# Makefile — cocotb testbench for weight_buffer.sv
-# Run from tb/weight_buffer/ directory:  make
-# Clean:                                 make clean
+# Makefile — cocotb testbench for accumulator.sv
+# Run from tb/accumulator/ directory:  make
+# Clean:                               make clean
 # =============================================================================
 
 SIM           ?= verilator
 TOPLEVEL_LANG ?= verilog
 
 # RTL source
-VERILOG_SOURCES = ../../rtl/activation_buffer.sv
+VERILOG_SOURCES = ../../rtl/accumulator.sv
 
-TOPLEVEL = activation_buffer
-MODULE   = tb_activation_buffer
+TOPLEVEL = accumulator
+MODULE   = tb_accumulator
 
 # Verilator flags
 EXTRA_ARGS += --timing --trace -Wall -Wno-DECLFILENAME
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
+
+# Clean rule
+clean::
+	rm -rf sim_build results.xml __pycache__ dump.vcd

@@ -1,26 +1,35 @@
 `default_nettype none
 
-module activation_buffer #(
+module unified_buffer #(
     parameter ROWS   = 8,
     parameter COLS   = 8,
     parameter DATA_W = 8
 )(
-    input  wire                             clk,
-    input  wire                             rst_n,
+    input  logic                            clk,
+    input  logic                            rst_n,
 
-    // Host write interface (shadow bank)
-    input  wire  [2:0]                      wr_addr,    // Column index 0–7
-    input  wire  [ROWS-1:0][DATA_W-1:0]     wr_data,    // All 8 row activations for one column
-    input  wire                             wr_en,
+    // Write interface
+    input  logic [2:0]                      wr_addr,        // Column index 0–7
+    input  logic [ROWS-1:0][DATA_W-1:0]     wr_data,        // All 8 row values for one column
+    input  logic                            wr_en,
 
-    // Control interface
-    input  wire                             load_trigger,   // Strobe: copy + stream
-    output logic                            ready,          // Shadow bank writable
-    output logic                            done,           // Pulse: streaming finished
+    // Computation control interface
+    input  logic                            load_trigger,   // Strobe: copy write → active, then stream
+    output logic                            ready,          // Write bank accepts writes
+    output logic                            load_done,      // Pulse: streaming finished
 
     // Systolic array interface
     output logic [ROWS-1:0][DATA_W-1:0]     act_out,        // Activation bus to array
-    output logic                            valid           // Asserted during STREAM phase
+    output logic                            valid,          // Asserted during STREAM phase
+
+    // Result bank control
+    input  logic                            store_trigger,  // Strobe: copy write → result bank
+    output logic                            store_done,     // Pulse: result bank copy complete
+
+    // Host read interface
+    input  logic [2:0]                      rd_addr,        // Column index 0–7
+    input  logic                            rd_en,          // Host read enable
+    output logic [ROWS-1:0][DATA_W-1:0]     rd_data         // One column from result bank (registered)
 );
 
     // ── Internal Parameters ──────────────────────────────────────
@@ -31,15 +40,17 @@ module activation_buffer #(
     typedef enum logic [1:0] {
         IDLE   = 2'b00,
         COPY   = 2'b01,
-        STREAM = 2'b10
+        STREAM = 2'b10,
+        STORE  = 2'b11
     } state_t;
 
     state_t              state, state_next;
     logic [CNT_W-1:0]    seq_cnt, seq_cnt_next;
 
     // ── Storage ──────────────────────────────────────────────────
-    logic [DATA_W-1:0]   shadow [ROWS][COLS];
+    logic [DATA_W-1:0]   write  [ROWS][COLS];
     logic [DATA_W-1:0]   active [ROWS][COLS];
+    logic [DATA_W-1:0]   result [ROWS][COLS];
 
     // ── State Register ───────────────────────────────────────────
     always_ff @(posedge clk) begin
@@ -59,8 +70,11 @@ module activation_buffer #(
 
         case (state)
             IDLE: begin
+                // load_trigger takes priority over store_trigger
                 if (load_trigger)
                     state_next = COPY;
+                else if (store_trigger)
+                    state_next = STORE;
             end
 
             COPY: begin
@@ -74,23 +88,27 @@ module activation_buffer #(
                     seq_cnt_next = seq_cnt + CNT_W'(1);
             end
 
+            STORE: begin
+                state_next = IDLE;
+            end
+
             default: state_next = IDLE;
         endcase
     end
 
-    // ── Shadow Bank — Host Write ─────────────────────────────────
+    // ── Write Bank — Host / Feedback Write ───────────────────────
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             for (int r = 0; r < ROWS; r++)
                 for (int c = 0; c < COLS; c++)
-                    shadow[r][c] <= '0;
+                    write[r][c] <= '0;
         end else if (wr_en && ready) begin
             for (int r = 0; r < ROWS; r++)
-                shadow[r][wr_addr] <= wr_data[r];
+                write[r][wr_addr] <= wr_data[r];
         end
     end
 
-    // ── Active Bank — Copy from Shadow ───────────────────────────
+    // ── Active Bank — Copy from Write Bank ───────────────────────
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             for (int r = 0; r < ROWS; r++)
@@ -99,7 +117,20 @@ module activation_buffer #(
         end else if (state == COPY) begin
             for (int r = 0; r < ROWS; r++)
                 for (int c = 0; c < COLS; c++)
-                    active[r][c] <= shadow[r][c];
+                    active[r][c] <= write[r][c];
+        end
+    end
+
+    // ── Result Bank — Copy from Write Bank ───────────────────────
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            for (int r = 0; r < ROWS; r++)
+                for (int c = 0; c < COLS; c++)
+                    result[r][c] <= '0;
+        end else if (state == STORE) begin
+            for (int r = 0; r < ROWS; r++)
+                for (int c = 0; c < COLS; c++)
+                    result[r][c] <= write[r][c];
         end
     end
 
@@ -115,9 +146,22 @@ module activation_buffer #(
         end
     end
 
+    // ── Host Read — Result Bank (Registered) ─────────────────────
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            rd_data <= '0;
+        end else if (rd_en) begin
+            for (int r = 0; r < ROWS; r++)
+                rd_data[r] <= result[r][rd_addr];
+        end else begin
+            rd_data <= '0;
+        end
+    end
+
     // ── Handshake Outputs ────────────────────────────────────────
-    assign ready = (state != COPY);
-    assign done  = (state == STREAM) && (seq_cnt == CNT_END);
+    assign ready      = (state == IDLE) || (state == STREAM);
+    assign load_done  = (state == STREAM) && (seq_cnt == CNT_END);
+    assign store_done = (state == STORE);
 
 endmodule
 

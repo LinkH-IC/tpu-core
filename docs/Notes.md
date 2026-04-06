@@ -643,22 +643,118 @@ tb/
 ```
 ---
 
-## Session 11 — TODO
+## Session 11 — 2026-04-05
 
-Next module: **Control FSM** (`control_fsm.sv`)
+### What We Did
 
-Design questions resolved so far:
-- **Host-stepped FSM:** FSM executes one phase at a time, returns to idle, waits for host command. No internal layer/tiling loop — host controls the sequence.
-- **Handoff boundary:** Host owns the write ports during loading. Host asserts `start` after loading is complete. FSM takes over datapath during computation and feedback.
-- **Write port mux:** Separate small module in top.sv, selects host vs ReLU feedback based on FSM phase.
-- **Drain-to-writeback wiring:** `col_idx` → `wr_addr`, `relu_out` → `wr_data`, `acc_valid` → `wr_en` — FSM bridges accumulator drain to unified buffer write port.
+1. **Designed the control FSM command interface:**
+   - Host-stepped coprocessor model: FSM executes one primitive per `start` strobe, returns to IDLE, host sequences layers externally
+   - Four commands via 2-bit `cmd` register: COMPUTE, DRAIN, STORE, CLEAR
+   - FSM is completely layer-agnostic — it has no concept of neural networks, layers, or tiling. The host decides what to do next.
 
-Open questions for next session:
-- Exact FSM state list and transitions
-- Host interface signals: what commands does the host send? Configuration registers for `shift_amount`, tiling count?
-- Status signals back to host: computation complete, drain complete, results ready?
-- Write port mux module design
-- How does `store_trigger` get asserted — by FSM or host directly?
+2. **Discussed the three-phase execution model:**
+   - **Prepare:** Host writes weights into weight buffer shadow + input into unified buffer write bank. FSM idle.
+   - **Execute:** Host issues command sequence (e.g., CLEAR → COMPUTE → DRAIN). FSM controls datapath.
+   - **Readback:** Host issues STORE, then reads result bank via `rd_addr`/`rd_en`/`rd_data`.
+   - For multi-layer (Iris): after DRAIN, ReLU output is already in the unified buffer write bank — host only loads new weights, not activations.
+
+3. **Discussed write port ownership and mux safety:**
+   - Unified buffer write port is driven through a mux in `top.sv`: HOST vs DRAIN path
+   - `mux_sel` controlled by FSM state — exclusive ownership, no contention
+   - Safety guaranteed structurally by handshake protocol: at every mux switch point, both sources are inactive (dead zone between `done`/`start` handshakes)
+
+4. **Discussed tiling for large matrices:**
+   - CLEAR once → COMPUTE N times → DRAIN once
+   - Accumulator preserves values across passes; `pass_done` auto-resets row counters
+   - Host can overlap next tile's weight/activation loading with current computation (double-buffering)
+
+5. **Discussed FSM vs combinational decode (Von Neumann analogy):**
+   - Pipelined RISC CPUs generate control signals combinationally from decode — works because each stage sees a single-cycle operation
+   - Our TPU is a multi-cycle coprocessor — one "matmul" takes dozens of cycles with handshakes (`done` signals), so sequential control (FSM) is required
+
+6. **Wrote `control_fsm.sv`:**
+   - 8 states (3-bit encoding): IDLE, LOAD_W, WAIT_W, LOAD_A, COMPUTE_WAIT, DRAIN_RUN, STORE_RUN, CLEAR_RUN
+   - COMPUTE path: IDLE → LOAD_W → WAIT_W → LOAD_A → COMPUTE_WAIT → IDLE
+   - DRAIN/STORE/CLEAR: single-state paths from IDLE
+   - All trigger outputs are pure state decodes — no extra registers needed
+   - `done` signal: combinational `(state != IDLE) && (state_next == IDLE)` — fires on last cycle of any command
+
+7. **Wrote `top.sv`:**
+   - Instantiates all 6 submodules: weight_buffer, unified_buffer, systolic_array, accumulator, relu, control_fsm
+   - Write port mux: combinational mux selects HOST (`ub_wr_*`) vs DRAIN (`col_idx`/`relu_out`/`acc_valid`) based on `fsm_mux_sel`
+   - Host-facing ports: write ports for both buffers, read port for result bank, `cmd`/`start`/`done`, `shift_amount`, `wb_ready`/`ub_ready`
+   - `valid_in` to systolic array connected directly (no replication — unified buffer now outputs per-row valid)
+
+8. **Updated `unified_buffer.sv`:**
+   - `valid` changed from scalar to `[ROWS-1:0]` — all rows asserted simultaneously during STREAM
+   - Matches `systolic_array.valid_in[ROWS-1:0]` directly
+
+9. **Updated `tb_unified_buffer.py`:**
+   - T1: `int(dut.valid.value) == 0` for vector comparison
+   - T2: valid expected `0xFF` (all 8 rows) instead of scalar `1`
+
+### Architecture Decisions
+
+| Parameter | Decision |
+|---|---|
+| Command interface | 2-bit `cmd` + `start` strobe + `done` response |
+| Command set | COMPUTE (00), DRAIN (01), STORE (10), CLEAR (11) |
+| FSM encoding | 8 states, 3-bit explicit encoding |
+| Trigger style | Pure state decodes (combinational outputs) |
+| Done signal | Combinational: `(state != IDLE) && (state_next == IDLE)` |
+| Write port mux | Combinational in `top.sv`, selected by `mux_sel` from FSM |
+| Mux safety | Structural — handshake protocol guarantees dead zone at every ownership transition |
+| Weight loading overlap | Host writes shadow during computation — hidden behind compute latency |
+| Tiling protocol | Host-driven: CLEAR → COMPUTE × N → DRAIN |
+| Layer sequencing | Host-driven: no internal layer loop in FSM |
+
+### Key Learnings
+
+- **Coprocessor model vs CPU decode:** A pipelined CPU decodes control signals combinationally because each pipeline stage processes one instruction per cycle. Our accelerator's operations span many cycles with handshakes, requiring sequential (FSM) control.
+- **Mux ownership safety is structural, not timing-dependent:** The handshake protocol (`done` → host sees it → host asserts `start`) naturally creates a dead zone where neither writer is active. No timing margins or clock domain tricks needed.
+- **The FSM doesn't know what it's computing:** COMPUTE is the same operation whether it's layer 1, layer 5, or a standalone matmul. Layer topology is host knowledge, not hardware knowledge.
+
+### Repo Status
+
+```
+rtl/
+  pe.sv                 ✅ Complete + verified
+  systolic_array.sv     ✅ Complete + verified
+  weight_buffer.sv      ✅ Complete + verified
+  unified_buffer.sv     ✅ Complete + verified (updated: valid now [ROWS-1:0])
+  accumulator.sv        ✅ Complete + verified
+  relu.sv               ✅ Complete + verified
+  control_fsm.sv        ✅ Complete (no standalone TB — straightforward state machine)
+  top.sv                ✅ Complete — all submodules wired
+tb/
+  pe/
+    tb_pe.sv                ✅ Complete
+  systolic_array/
+    tb_systolic_array.py    ✅ Complete
+    Makefile
+  weight_buffer/
+    tb_weight_buffer.py     ✅ Complete
+    Makefile
+  unified_buffer/
+    tb_unified_buffer.py    ✅ Complete — updated for [ROWS-1:0] valid
+    Makefile
+  accumulator/
+    tb_accumulator.py       ✅ Complete
+    Makefile
+  relu/
+    tb_relu.sv              ✅ Complete
+```
+
+---
+
+## Session 12 — TODO
+
+All RTL modules complete. Next steps:
+
+- **Top-level integration test:** cocotb testbench for `top.sv` — drive the host interface through a full Iris inference (2-layer MLP: load W1 + input → CLEAR → COMPUTE → DRAIN → load W2 → CLEAR → COMPUTE → DRAIN → STORE → read results)
+- **Re-run `tb_unified_buffer.py`** to confirm the `[ROWS-1:0] valid` change passes all 14 tests
+- **Synthesis:** run through Yosys to check for lint/elaboration issues across all modules
+- **FPGA phase planning:** UART interface, pre-trained INT8 weights, live inference demo
 
 ---
 

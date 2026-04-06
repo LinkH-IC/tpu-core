@@ -172,7 +172,7 @@ async def t1_reset(dut):
     assert dut.ready.value             == 1, "ready should be 1 after reset"
     assert dut.load_done.value         == 0, "load_done should be 0 after reset"
     assert int(dut.act_out.value)      == 0, "act_out should be 0 after reset"
-    assert dut.valid.value             == 0, "valid should be 0 after reset"
+    assert int(dut.valid.value)        == 0, "valid should be 0 after reset"
     assert dut.store_done.value        == 0, "store_done should be 0 after reset"
     assert int(dut.rd_data.value)      == 0, "rd_data should be 0 after reset"
 
@@ -193,7 +193,7 @@ async def t2_basic_load(dut):
         expected = [int(A[r][c]) for r in range(ROWS)]
         assert captured_a[c] == expected, \
             f"Col {c}: expected {expected}, got {captured_a[c]}"
-        assert captured_v[c] == 1, \
+        assert captured_v[c] == (1 << ROWS) - 1, \
             f"Col {c}: valid expected 1, got {captured_v[c]}"
 
     dut._log.info("T2 PASSED — identity matrix load and streaming output")

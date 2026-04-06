@@ -20,7 +20,7 @@ module unified_buffer #(
 
     // Systolic array interface
     output logic [ROWS-1:0][DATA_W-1:0]     act_out,        // Activation bus to array
-    output logic                            valid,          // Asserted during STREAM phase
+    output logic [ROWS-1:0]                 valid,          // Asserted during STREAM phase
 
     // Result bank control
     input  logic                            store_trigger,  // Strobe: copy write → result bank
@@ -142,7 +142,7 @@ module unified_buffer #(
         if (state == STREAM) begin
             for (int r = 0; r < ROWS; r++)
                 act_out[r] = active[r][seq_cnt];
-            valid = 1'b1;
+            valid = '1;
         end
     end
 

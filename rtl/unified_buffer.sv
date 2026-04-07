@@ -117,7 +117,7 @@ module unified_buffer #(
         end else if (state == COPY) begin
             for (int r = 0; r < ROWS; r++)
                 for (int c = 0; c < COLS; c++)
-                    active[r][c] <= write[r][c];
+                    active[r][c] <= write[c][r];
         end
     end
 
@@ -137,7 +137,7 @@ module unified_buffer #(
     // ── Sequencer — Drive Array Activations ──────────────────────
     always_comb begin
         act_out = '0;
-        valid   = 1'b0;
+        valid   = '0;
 
         if (state == STREAM) begin
             for (int r = 0; r < ROWS; r++)

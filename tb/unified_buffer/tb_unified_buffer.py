@@ -304,7 +304,7 @@ async def t6_random_matrix(dut):
     captured_a, _ = await trigger_load_and_capture(dut)
 
     for c in range(COLS):
-        expected = [int(A[r][c]) for r in range(ROWS)]
+        expected = [int(A[c][r]) for r in range(ROWS)]
         assert captured_a[c] == expected, \
             f"Col {c}: expected {expected}, got {captured_a[c]}"
 
@@ -324,7 +324,7 @@ async def t7_back_to_back(dut):
         cap, _ = await trigger_load_and_capture(dut)
 
         for c in range(COLS):
-            expected = [int(A[r][c]) for r in range(ROWS)]
+            expected = [int(A[c][r]) for r in range(ROWS)]
             assert cap[c] == expected, \
                 f"Pass {pass_num+1} col {c}: mismatch"
 
@@ -389,7 +389,7 @@ async def t9_pipeline_overlap(dut):
     cap2, _ = await trigger_load_and_capture(dut)
 
     for c in range(COLS):
-        expected = [int(A2[r][c]) for r in range(ROWS)]
+        expected = [int(A2[c][r]) for r in range(ROWS)]
         assert cap2[c] == expected, \
             f"Col {c}: expected A2 {expected}, got {cap2[c]}"
 
@@ -515,7 +515,7 @@ async def t14_full_pipeline(dut):
     # Step 2: Load and stream (verify streaming output)
     cap_stream, _ = await trigger_load_and_capture(dut)
     for c in range(COLS):
-        expected = [int(A[r][c]) for r in range(ROWS)]
+        expected = [int(A[c][r]) for r in range(ROWS)]
         assert cap_stream[c] == expected, \
             f"Stream col {c}: expected {expected}, got {cap_stream[c]}"
 
@@ -532,3 +532,37 @@ async def t14_full_pipeline(dut):
 
     dut._log.info("T14 PASSED — full pipeline end-to-end correct")
     
+
+@cocotb.test()
+async def t15_transpose_copy(dut):
+    """T15: Verify transposed copy — streaming output is write bank transposed.
+ 
+    Write a non-symmetric matrix, confirm that streaming column k = row k of
+    the written matrix.  Result bank (STORE) should still be a direct copy.
+    """
+    await init_and_reset(dut)
+ 
+    # Non-symmetric matrix so transpose is clearly distinguishable
+    A = np.zeros((ROWS, COLS), dtype=np.int8)
+    for r in range(ROWS):
+        for c in range(COLS):
+            A[r][c] = np.int8(r * 10 + c)   # e.g. A[2][5] = 25
+ 
+    await write_bank_fill(dut, A)
+ 
+    # Streaming output should be A transposed
+    cap_stream, _ = await trigger_load_and_capture(dut)
+    for c in range(COLS):
+        expected_stream = [int(A[c][r]) for r in range(ROWS)]  # row k of A
+        assert cap_stream[c] == expected_stream, \
+            f"Stream col {c}: expected row {c} of A = {expected_stream}, got {cap_stream[c]}"
+ 
+    # Result bank should be A direct (no transpose)
+    await trigger_store(dut)
+    cap_read = await read_result_bank(dut)
+    for c in range(COLS):
+        expected_read = [int(A[r][c]) for r in range(ROWS)]  # column c of A
+        assert cap_read[c] == expected_read, \
+            f"Read col {c}: expected col {c} of A = {expected_read}, got {cap_read[c]}"
+ 
+    dut._log.info("T15 PASSED — transposed copy confirmed (stream=A^T, result=A)")

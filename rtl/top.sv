@@ -30,18 +30,21 @@ module top #(
     output logic                            done,
 
     // Host — ReLU configuration
+    input  logic [1:0]                      act_sel,      // 00=ReLU, 01=LeakyReLU, 10=Bypass, 11=BinaryStep
     input  logic [4:0]                      shift_amount,
-
-    // Host — accumulator read port (full-precision 32-bit)
-    input  logic [2:0]                      acc_rd_addr,
-    input  logic                            acc_rd_en,
-    output logic [ROWS-1:0][ACC_W-1:0]      acc_rd_data,
+    input  logic [2:0]                      leak_shift,   // Leaky ReLU negative divisor (2^leak_shift)
 
     // Host — buffer status
     output logic                            wb_ready,
     output logic                            ub_ready
 );
 
+    // ── Activation Function Encoding ─────────────────────────
+    localparam logic [1:0] ACT_RELU        = 2'b00,
+                           ACT_LEAKY_RELU  = 2'b01,
+                           ACT_BYPASS      = 2'b10,
+                           ACT_BINARY_STEP = 2'b11;
+    
     // ── Internal Wires — Weight Buffer to Systolic Array ──────
     logic [ROWS-1:0][DATA_W-1:0]    wb_weight_out;
     logic [COLS-1:0]                wb_weight_load;
@@ -59,8 +62,12 @@ module top #(
     logic [$clog2(COLS)-1:0]        acc_col_idx;
     logic                           acc_valid;
 
-    // ── Internal Wires — ReLU to Write Port Mux ──────────────
-    logic [ROWS-1:0][DATA_W-1:0]    relu_out;
+    // ── Internal Wires — Activation Function Outputs ─────────
+    logic [ROWS-1:0][DATA_W-1:0]    relu_result;
+    logic [ROWS-1:0][DATA_W-1:0]    leaky_result;
+    logic [ROWS-1:0][DATA_W-1:0]    bypass_result;
+    logic [ROWS-1:0][DATA_W-1:0]    bstep_result;
+    logic [ROWS-1:0][DATA_W-1:0]    act_out;          // Selected activation output
 
     // ── Internal Wires — FSM Handshake ───────────────────────
     logic        fsm_mux_sel;
@@ -86,7 +93,7 @@ module top #(
     always_comb begin
         if (fsm_mux_sel) begin
             ub_mux_wr_addr = acc_col_idx;
-            ub_mux_wr_data = relu_out;
+            ub_mux_wr_data = act_out;
             ub_mux_wr_en   = acc_valid;
         end else begin
             ub_mux_wr_addr = ub_wr_addr;
@@ -169,13 +176,10 @@ module top #(
         .col_idx       (acc_col_idx),
         .acc_valid     (acc_valid),
         .pass_done     (fsm_acc_pass_done),
-        .drain_done    (fsm_acc_drain_done),
-        .rd_addr       (acc_rd_addr),
-        .rd_en         (acc_rd_en),
-        .rd_data       (acc_rd_data)
+        .drain_done    (fsm_acc_drain_done)
     );
 
-    // ── ReLU (Combinational) ─────────────────────────────────
+    // ── Activation Functions (all combinational) ─────────────────────────────────
     relu #(
         .ROWS   (ROWS),
         .ACC_W  (ACC_W),
@@ -183,8 +187,49 @@ module top #(
     ) u_relu (
         .data_in      (acc_out),
         .shift_amount (shift_amount),
-        .data_out     (relu_out)
+        .data_out     (relu_result)
     );
+
+    leaky_relu #(
+        .ROWS   (ROWS),
+        .ACC_W  (ACC_W),
+        .DATA_W (DATA_W)
+    ) u_leaky_relu (
+        .data_in      (acc_out),
+        .shift_amount (shift_amount),
+        .leak_shift   (leak_shift),
+        .data_out     (leaky_result)
+    );
+ 
+    bypass #(
+        .ROWS   (ROWS),
+        .ACC_W  (ACC_W),
+        .DATA_W (DATA_W)
+    ) u_bypass (
+        .data_in      (acc_out),
+        .shift_amount (shift_amount),
+        .data_out     (bypass_result)
+    );
+ 
+    binary_step #(
+        .ROWS   (ROWS),
+        .ACC_W  (ACC_W),
+        .DATA_W (DATA_W)
+    ) u_binary_step (
+        .data_in      (acc_out),
+        .data_out     (bstep_result)
+    );
+
+    // ── Activation Function Select Mux ───────────────────────
+    always_comb begin
+        case (act_sel)
+            ACT_RELU:        act_out = relu_result;
+            ACT_LEAKY_RELU:  act_out = leaky_result;
+            ACT_BYPASS:      act_out = bypass_result;
+            ACT_BINARY_STEP: act_out = bstep_result;
+            default:         act_out = bypass_result;
+        endcase
+    end
 
     // ── Control FSM ──────────────────────────────────────────
     control_fsm u_control_fsm (

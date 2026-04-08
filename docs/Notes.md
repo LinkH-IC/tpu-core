@@ -747,14 +747,155 @@ tb/
 
 ---
 
-## Session 12 — TODO
+## Session 12 — 2026-04-07
 
-All RTL modules complete. Next steps:
+### What We Did
 
-- **Top-level integration test:** cocotb testbench for `top.sv` — drive the host interface through a full Iris inference (2-layer MLP: load W1 + input → CLEAR → COMPUTE → DRAIN → load W2 → CLEAR → COMPUTE → DRAIN → STORE → read results)
-- **Re-run `tb_unified_buffer.py`** to confirm the `[ROWS-1:0] valid` change passes all 14 tests
-- **Synthesis:** run through Yosys to check for lint/elaboration issues across all modules
-- **FPGA phase planning:** UART interface, pre-trained INT8 weights, live inference demo
+1. **Traced the full datapath math with a 3×3 example:**
+   - Confirmed: PE(r,c) = W[r][c], array computes Wᵀ × A, accumulator stores Aᵀ W (equivalently (Wᵀ A)ᵀ)
+   - Identified that the drain outputs Aᵀ W directly to the UB — no extra transpose in drain
+   - Discovered the feedback loop problem: single-vector results spread across row 0 (not column 0), so the next layer's column-streaming only sees one element per step
+
+2. **Chose transposed copy as the fix (Link's design):**
+   - One-line change in `unified_buffer.sv`: `active[r][c] <= write[c][r]` during COPY
+   - This makes the array compute **A × W** consistently (right-multiply convention)
+   - Self-correcting: the transpose rotates "row spread across columns" back to "column down rows" every layer, so the feedback loop works automatically
+   - No changes needed to accumulator drain, weight buffer, ReLU, or FSM
+
+3. **Updated `tb_unified_buffer.py`:**
+   - T2/T5/T8 unchanged (symmetric data)
+   - T6, T7, T9, T14: streaming expectations changed from `A[r][c]` to `A[c][r]` (transposed)
+   - T15 added: explicit transpose verification with non-symmetric matrix — confirms streaming = Aᵀ, result bank = A direct
+   - All 15 tests pass
+
+4. **Wrote `tb_top.py` — top-level integration testbench (5 tests):**
+
+   | Test | Description |
+   |------|-------------|
+   | T1 | Reset state: done=0, wb_ready=1, ub_ready=1 |
+   | T2 | Random 8×8 matmul with ReLU — verify result bank |
+   | T3 | Two-layer MLP (4→8→3) — full feedback loop with ReLU |
+   | T4 | Bypass — negatives preserved in result bank |
+   | T5 | Leaky ReLU — negative attenuation with leak_shift=2 |
+
+5. **Wrote `tb_iris.py` — real application testbench (2 tests):**
+
+   | Test | Description |
+   |------|-------------|
+   | T1 | Full inference: all 30 Iris samples, bit-exact vs y_ref (30/30) |
+   | T2 | Bypass spot-check: layer 1 accumulator values verified through bypass drain |
+
+6. **Wrote `iris_train.py` — training + quantization script:**
+   - PyTorch training (500 epochs, Adam, no bias), StandardScaler normalization
+   - Symmetric INT8 quantization [-127, +127], per-layer adaptive shift calculation
+   - Reference model matches hardware exactly: relu → shift → clamp (correct order)
+   - Exports `iris_tpu_test.npz` with W1, W2, shifts, padded X_test, y_test, y_ref
+   - Float accuracy: 93.3%, INT8 accuracy: 93.3% (28/30, 2 versicolor boundary misses)
+
+7. **Added three new activation function modules:**
+
+   | Module | act_sel | Operation | Parameters |
+   |--------|---------|-----------|------------|
+   | `relu.sv` | 00 | clip neg → shift → clamp [0, 127] | `shift_amount` |
+   | `leaky_relu.sv` | 01 | shift → leak neg → clamp [-128, 127] | `shift_amount`, `leak_shift` |
+   | `bypass.sv` | 10 | shift → clamp [-128, 127] | `shift_amount` |
+   | `binary_step.sv` | 11 | x > 0 → 1, else → 0 | none |
+
+8. **Updated `top.sv`:**
+   - Removed accumulator host read port (`acc_rd_addr`, `acc_rd_en`, `acc_rd_data`)
+   - Added `act_sel[1:0]`, `leak_shift[2:0]` host ports
+   - All four activation modules instantiated in parallel, 4:1 mux selects output
+   - Write port mux now drives `act_out` (selected activation) instead of hardwired `relu_out`
+
+9. **Updated `accumulator.sv`:** removed host read port (rd_addr, rd_en, rd_data, read always_ff)
+
+10. **FSM unchanged** — activation selection is purely a datapath mux, FSM triggers DRAIN identically regardless of `act_sel`
+
+### Architecture Decisions
+
+| Parameter | Decision |
+|---|---|
+| Datapath convention | A × W (right-multiply), enforced by transposed copy in UB |
+| Transposed copy | `active[r][c] <= write[c][r]` during COPY; STORE remains direct |
+| Single-vector layout | Input x in ROW 0 of write bank; results in ROW 0 of output |
+| Activation functions | 4 options via 2-bit `act_sel`, all combinational, parallel with mux |
+| Accumulator read port | Removed — bypass drain provides visibility into 32-bit values |
+| Iris inference | 93.3% (28/30), bit-exact hardware-reference match on all 30 samples |
+
+### Key Learnings
+
+- **Transposed copy is self-correcting for multi-layer feedback:** Each drain puts results in row-major form in the UB write bank. The transposed copy rotates this back to column-major for the next layer's streaming. This happens automatically every layer — no special case logic needed.
+- **INT8 quantization loses boundary samples:** Samples deep inside their class cluster are robust; samples near decision boundaries rely on float precision that INT8 can't preserve. This is inherent to quantization, not a hardware bug.
+- **Bypass drain replaces accumulator read port:** Instead of dedicated 32-bit read hardware, draining with bypass + appropriate shift gives visibility into accumulator values through the existing result bank. Less hardware, same diagnostic capability.
+- **Activation function selection is a pure datapath concern:** The FSM doesn't need to know which activation is selected. The host sets `act_sel` before DRAIN, and the mux handles the rest. Clean separation of control and datapath.
+- **Training script pitfalls:** ReLU-before-shift order matters — the reference model must match hardware exactly or bit-exact comparison fails. StandardScaler before quantization is critical for dynamic range. Layer 2 also passes through ReLU in hardware (no bypass) — reference must account for this.
+
+### Repo Status
+
+```
+rtl/
+  pe.sv                 ✅ Complete + verified
+  systolic_array.sv     ✅ Complete + verified
+  weight_buffer.sv      ✅ Complete + verified
+  unified_buffer.sv     ✅ Complete + verified (transposed copy added)
+  accumulator.sv        ✅ Complete + verified (host read port removed)
+  relu.sv               ✅ Complete + verified
+  leaky_relu.sv         ✅ Complete (tested via tb_top T5)
+  bypass.sv             ✅ Complete (tested via tb_top T4, tb_iris T2)
+  binary_step.sv        ✅ Complete (no dedicated test yet)
+  control_fsm.sv        ✅ Complete (unchanged)
+  top.sv                ✅ Complete + verified (4 activation functions, act_sel mux)
+tb/
+  pe/
+    tb_pe.sv                ✅ Complete
+  systolic_array/
+    tb_systolic_array.py    ✅ Complete
+    Makefile
+  weight_buffer/
+    tb_weight_buffer.py     ✅ Complete
+    Makefile
+  unified_buffer/
+    tb_unified_buffer.py    ✅ Complete — 15 TESTS PASS (transposed copy)
+    Makefile
+  accumulator/
+    tb_accumulator.py       ✅ Complete
+    Makefile
+  relu/
+    tb_relu.sv              ✅ Complete
+  top/
+    tb_top.py               ✅ Complete — 5 TESTS PASS
+    Makefile
+  iris/
+    tb_iris.py              ✅ Complete — 2 TESTS PASS (30/30 bit-exact)
+    iris_tpu_test.npz       ✅ Iris test data (trained weights + 30 samples)
+    iris_train.py           ✅ Training script
+    Makefile
+```
+---
+
+## Session 13 — TODO
+
+### Planned
+
+1. **Bias support in accumulator:**
+   - Add a bias register file (8 × 8-bit or 8 × 32-bit, one per column)
+   - Cleanest location: between accumulator drain and activation function (combinational add)
+   - Host writes bias values before COMPUTE; bias added during drain per-element
+   - Training script needs `bias=True` in `nn.Linear`
+   - Zero FSM changes — bias is purely a datapath addition
+
+2. **MNIST handwritten digits (784→64→10 or similar):**
+   - Requires multi-pass tiling: 784 inputs = 98 tiles of 8 through the array
+   - Accumulator tiling already supported (`pass_done` resets counters, preserves values)
+   - Host software manages the outer tiling loop
+   - Larger hidden layer (64) also needs tiling on output dimension
+   - Good stress test for every feature: tiling, feedback, bypass on final layer
+
+3. **Optimisation opportunities:**
+   - **Weight buffer reuse:** Skip W1 reload between same-layer samples (currently reloads every sample because W2 overwrites the shadow bank)
+   - **Double-buffer the weight buffer shadow:** Two shadow banks would allow pre-loading next layer's weights during computation
+   - **Pipeline DRAIN + next-layer weight loading:** Drain takes 8 cycles during which the weight buffer shadow bank is idle
+   - **Binary step testbench:** Add dedicated test for completeness
 
 ---
 

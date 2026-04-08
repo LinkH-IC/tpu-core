@@ -23,12 +23,7 @@ module accumulator #(
 
     // Handshake
     output logic                           pass_done,       // Pulse: all columns received this pass
-    output logic                           drain_done,       // Pulse: drain finished
-
-    // Host read interface (full-precision 32-bit results)
-    input  logic [$clog2(COLS)-1:0]        rd_addr,         // Column index 0–7
-    input  logic                           rd_en,           // Read enable
-    output logic [ROWS-1:0][ACC_W-1:0]     rd_data          // One column, 8×32-bit (registered)
+    output logic                           drain_done       // Pulse: drain finished
 );
 
     // ── Internal Parameters ──────────────────────────────────────
@@ -150,18 +145,6 @@ module accumulator #(
 
     // ── Done Signal — Drain Complete ─────────────────────────────
     assign drain_done = (state == DRAIN) && (drain_cnt == COL_END);
-
-    // ── Host Read — Full-Precision Results (Registered) ───────────
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            rd_data <= '0;
-        end else if (rd_en) begin
-            for (int r = 0; r < ROWS; r++)
-                rd_data[r] <= acc_reg[r][rd_addr];
-        end else begin
-            rd_data <= '0;
-        end
-    end
 
 endmodule
 

@@ -1,7 +1,7 @@
 # =============================================================================
 # Makefile — cocotb testbench for systolic_array.sv
-# Run from tb/systolic_array/ directory:  make
-# Clean:                   make clean
+# Run from tb/systolic_array/ directory:    make
+# Clean:                                    make clean
 # =============================================================================
 
 SIM           ?= verilator

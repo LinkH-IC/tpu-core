@@ -1,25 +1,22 @@
 """
 tb_iris.py — Real application test: Iris flower classification on the TPU core.
-
-Loads pre-trained INT8 weights and 30 test samples from iris_tpu_test.npz,
-runs each sample through the full two-layer MLP pipeline, and verifies
-bit-exact match against the integer-only reference predictions.
-
+ 
+Loads pre-trained INT8 weights, biases, and 30 test samples from
+iris_tpu_test.npz, runs each sample through the full two-layer MLP pipeline
+with leaky ReLU activation and bias addition, and verifies bit-exact match
+against the integer-only reference predictions.
+ 
 Hardware pipeline per sample:
-  1. Host writes W1 to weight buffer, x to UB write bank (row 0)
-  2. CLEAR → COMPUTE → DRAIN  (layer 1: relu(x @ W1) → UB write bank)
-  3. Host writes W2 to weight buffer (activations already in UB from drain)
-  4. CLEAR → COMPUTE → DRAIN → STORE  (layer 2: relu(h @ W2) → result bank)
+  1. Host writes W1 to weight buffer, b1 to bias_add, x to UB write bank (row 0)
+  2. CLEAR → COMPUTE → DRAIN  (layer 1: leaky_relu(x @ W1 + b1) → UB write bank)
+  3. Host writes W2 to weight buffer, b2 to bias_add
+  4. CLEAR → COMPUTE → DRAIN → STORE  (layer 2: leaky_relu(h @ W2 + b2) → result bank)
   5. Host reads result bank row 0, columns 0–2 → argmax → predicted class
-
-Optimisation: W1 and W2 only need loading once (not per sample). Between
-samples, only the activation write bank is refilled.
-
+ 
 Tests:
   T1: Full inference — all 30 samples, bit-exact against y_ref
-  T2: Spot-check accumulator — verify layer 1 hidden values for sample 0
-
-Run:  make  (from tb/top/ directory, with iris_tpu_test.npz in same dir)
+ 
+Run:  make  (from tb/iris/ directory, with iris_tpu_test.npz in same dir)
 """
 
 import cocotb
@@ -37,8 +34,9 @@ CMD_DRAIN   = 1
 CMD_STORE   = 2
 CMD_CLEAR   = 3
 
-ACT_RELU   = 0
-ACT_BYPASS = 2
+ACT_RELU        = 0
+ACT_LEAKY_RELU  = 1
+ACT_BYPASS      = 2
 
 CLASS_NAMES = ["setosa", "versicolor", "virginica"]
 
@@ -99,6 +97,9 @@ async def init_and_reset(dut):
     dut.act_sel.value       = 0
     dut.shift_amount.value  = 0
     dut.leak_shift.value    = 0
+    dut.bias_wr_addr.value  = 0
+    dut.bias_wr_data.value  = 0
+    dut.bias_wr_en.value    = 0
     for _ in range(3):
         await RisingEdge(dut.clk)
     dut.rst_n.value = 1
@@ -132,6 +133,16 @@ async def write_activation_row(dut, x):
     dut.ub_wr_en.value = 0
 
 
+async def write_bias(dut, b):
+    """Write bias vector (8 × int32) into bias_add register file."""
+    for c in range(COLS):
+        dut.bias_wr_addr.value = c
+        dut.bias_wr_data.value = int(b[c]) & 0xFFFFFFFF
+        dut.bias_wr_en.value   = 1
+        await RisingEdge(dut.clk)
+    dut.bias_wr_en.value = 0
+
+
 async def issue_cmd(dut, cmd, timeout=600):
     dut.cmd.value   = cmd
     dut.start.value = 1
@@ -160,47 +171,6 @@ async def read_result_row0(dut):
     return outputs
 
 
-async def read_accumulator(dut):
-    """Read full 8×8 INT32 accumulator."""
-    R = np.zeros((ROWS, COLS), dtype=np.int32)
-    for c in range(COLS):
-        dut.acc_rd_addr.value = c
-        dut.acc_rd_en.value   = 1
-        await RisingEdge(dut.clk)
-        await FallingEdge(dut.clk)
-        vals = unpack_row(dut.acc_rd_data.value, ROWS, 32)
-        for r in range(ROWS):
-            R[r][c] = np.int32(vals[r])
-    dut.acc_rd_en.value = 0
-    return R
-
-
-async def run_inference(dut, W1, W2, x, shift1, shift2):
-    """Run a full two-layer inference for one sample.
-
-    Assumes W1 is already in the weight buffer shadow bank on first call.
-    Returns (predicted_class, output_values).
-    """
-    # ── Layer 1 ───────────────────────────────────────────────
-    dut.shift_amount.value = shift1
-    await write_activation_row(dut, x)
-    await issue_cmd(dut, CMD_CLEAR)
-    await issue_cmd(dut, CMD_COMPUTE)
-    await issue_cmd(dut, CMD_DRAIN)
-    # Hidden activations now in UB write bank (from drain feedback)
-
-    # ── Layer 2 ───────────────────────────────────────────────
-    dut.shift_amount.value = shift2
-    await issue_cmd(dut, CMD_CLEAR)
-    await issue_cmd(dut, CMD_COMPUTE)
-    await issue_cmd(dut, CMD_DRAIN)
-    await issue_cmd(dut, CMD_STORE)
-
-    # ── Read outputs ──────────────────────────────────────────
-    outputs = await read_result_row0(dut)
-    predicted = int(np.argmax(outputs))
-    return predicted, outputs
-
 
 # ── Tests ─────────────────────────────────────────────────────
 
@@ -212,17 +182,21 @@ async def t1_full_iris_inference(dut):
     data = load_test_data()
     W1       = data['W1']
     W2       = data['W2']
+    b1         = data['b1']
+    b2         = data['b2']
     shift1   = int(data['shift1'])
     shift2   = int(data['shift2'])
+    leak_shift = int(data['leak_shift'])
     X_test   = data['X_test']
     y_test   = data['y_test']
     y_ref    = data['y_ref']
     n_samples = len(y_test)
 
-    dut._log.info(f"Loaded {n_samples} samples, shift1={shift1}, shift2={shift2}")
+    dut._log.info(f"Loaded {n_samples} samples, shift1={shift1}, shift2={shift2}, leak_shift={leak_shift}")
 
-    # Pre-load W1 into weight buffer (stays for all layer-1 passes)
+    # Pre-load W1 and b1 into weight buffer and bias registers
     await write_weights(dut, W1)
+    await write_bias(dut, b1)
 
     correct_vs_ref  = 0
     correct_vs_true = 0
@@ -236,6 +210,7 @@ async def t1_full_iris_inference(dut):
         # For subsequent samples, we must reload W1 before layer 1.
         if i > 0:
             await write_weights(dut, W1)
+            await write_bias(dut, b1)
 
         dut.act_sel.value       = ACT_RELU
         dut.shift_amount.value  = shift1
@@ -248,7 +223,8 @@ async def t1_full_iris_inference(dut):
 
         # Layer 2: load W2
         await write_weights(dut, W2)
-        dut.act_sel.value      = ACT_RELU
+        await write_bias(dut, b2)
+        dut.act_sel.value      = ACT_LEAKY_RELU
         dut.shift_amount.value = shift2
         await issue_cmd(dut, CMD_CLEAR)
         await issue_cmd(dut, CMD_COMPUTE)

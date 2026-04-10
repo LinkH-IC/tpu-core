@@ -18,7 +18,7 @@ module accumulator #(
 
     // Output interface (to ReLU)
     output logic [ROWS-1:0][ACC_W-1:0]     acc_out,         // One row of results during drain
-    output logic [$clog2(ROWS)-1:0]        col_idx,         // Which row is currently being output
+    output logic [$clog2(COLS)-1:0]        col_idx,         // Which row is currently being output
     output logic                           acc_valid,       // High for one cycle per row during drain
 
     // Handshake

@@ -24,6 +24,11 @@ module top #(
     input  logic                            ub_rd_en,
     output logic [ROWS-1:0][DATA_W-1:0]     ub_rd_data,
 
+    // Host — bias write port
+    input  logic [2:0]                      bias_wr_addr,
+    input  logic [ACC_W-1:0]                bias_wr_data,
+    input  logic                            bias_wr_en,
+
     // Host — command interface
     input  logic [1:0]                      cmd,
     input  logic                            start,
@@ -61,6 +66,9 @@ module top #(
     logic [ROWS-1:0][ACC_W-1:0]     acc_out;
     logic [$clog2(COLS)-1:0]        acc_col_idx;
     logic                           acc_valid;
+
+    // ── Internal Wires — Bias Add to Activation Functions ────
+    logic [ROWS-1:0][ACC_W-1:0]     biased_out;
 
     // ── Internal Wires — Activation Function Outputs ─────────
     logic [ROWS-1:0][DATA_W-1:0]    relu_result;
@@ -178,14 +186,30 @@ module top #(
         .pass_done     (fsm_acc_pass_done),
         .drain_done    (fsm_acc_drain_done)
     );
-
+ 
+    // ── Bias Addition ──────────────────────────────────────────
+    bias_add #(
+        .ROWS  (ROWS),
+        .COLS  (COLS),
+        .ACC_W (ACC_W)
+    ) u_bias_add (
+        .clk      (clk),
+        .rst_n    (rst_n),
+        .wr_addr  (bias_wr_addr),
+        .wr_data  (bias_wr_data),
+        .wr_en    (bias_wr_en),
+        .data_in  (acc_out),
+        .col_idx  (acc_col_idx),
+        .data_out (biased_out)
+    );
+ 
     // ── Activation Functions (all combinational) ─────────────────────────────────
     relu #(
         .ROWS   (ROWS),
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_relu (
-        .data_in      (acc_out),
+        .data_in      (biased_out),
         .shift_amount (shift_amount),
         .data_out     (relu_result)
     );
@@ -195,7 +219,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_leaky_relu (
-        .data_in      (acc_out),
+        .data_in      (biased_out),
         .shift_amount (shift_amount),
         .leak_shift   (leak_shift),
         .data_out     (leaky_result)
@@ -206,7 +230,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_bypass (
-        .data_in      (acc_out),
+        .data_in      (biased_out),
         .shift_amount (shift_amount),
         .data_out     (bypass_result)
     );
@@ -216,7 +240,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_binary_step (
-        .data_in      (acc_out),
+        .data_in      (biased_out),
         .data_out     (bstep_result)
     );
 

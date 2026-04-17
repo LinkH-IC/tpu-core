@@ -1,0 +1,51 @@
+# ============================================================================
+# TPU Core — Yosys Synthesis Script
+# Target: SKY130 HD standard cells, TT corner (25°C, 1.8V)
+# Usage:  yosys -s synth.ys 2>&1 | tee synth.log
+# ============================================================================
+
+# ---- Read Liberty ----
+# UPDATE this path to where your .lib file lives
+read_liberty -lib sky130_fd_sc_hd__tt_025C_1v80.lib
+
+# ---- Read RTL (SystemVerilog) ----
+read_verilog -sv ../rtl/pe.sv
+read_verilog -sv ../rtl/systolic_array.sv
+read_verilog -sv ../rtl/weight_buffer.sv
+read_verilog -sv ../rtl/unified_buffer.sv
+read_verilog -sv ../rtl/accumulator.sv
+read_verilog -sv ../rtl/relu.sv
+read_verilog -sv ../rtl/leaky_relu.sv
+read_verilog -sv ../rtl/bypass.sv
+read_verilog -sv ../rtl/binary_step.sv
+read_verilog -sv ../rtl/bias_add.sv
+read_verilog -sv ../rtl/control_fsm.sv
+read_verilog -sv ../rtl/top.sv
+
+# ---- Elaborate & Check ----
+hierarchy -top top
+check
+
+# ---- Generic Synthesis ----
+# -flatten merges all hierarchy for better optimization
+synth -top top -flatten
+
+# ---- Technology Mapping ----
+# Map flip-flops to SKY130 DFF cells
+dfflibmap -liberty sky130_fd_sc_hd__tt_025C_1v80.lib
+
+# Map combinational logic to SKY130 cells
+# -D 10000 : target delay 10 ns (100 MHz) guides ABC optimization
+abc -liberty sky130_fd_sc_hd__tt_025C_1v80.lib -D 10000
+
+# ---- Post-Map Cleanup ----
+opt_clean -purge
+clean
+check
+
+# ---- Reports ----
+tee -o reports/stat.rpt stat -liberty sky130_fd_sc_hd__tt_025C_1v80.lib
+tee -o reports/cells.rpt stat -top top
+
+# ---- Write Gate-Level Netlist ----
+write_verilog -noattr -noexpr -nohex netlist/top_sky130.v

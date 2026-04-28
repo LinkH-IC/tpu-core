@@ -84,7 +84,8 @@ module control_fsm (
             end
 
             LOAD_A: begin
-                state_next = COMPUTE_WAIT;
+                if (ub_load_done)
+                    state_next = COMPUTE_WAIT;
             end
 
             COMPUTE_WAIT: begin
@@ -111,10 +112,10 @@ module control_fsm (
     end
 
     // ── Output Logic ───────────────────────────────────────────
-    assign wb_load_trigger  = (state == LOAD_W);
-    assign ub_load_trigger  = (state == LOAD_A);
-    assign ub_store_trigger = (state == STORE_RUN);
-    assign acc_clear        = (state == CLEAR_RUN);
+    assign wb_load_trigger   = (state == LOAD_W);
+    assign ub_load_trigger   = (state == LOAD_A);
+    assign ub_store_trigger  = (state == STORE_RUN);
+    assign acc_clear         = (state == CLEAR_RUN);
     assign acc_drain_trigger = (state == DRAIN_RUN);
 
     assign mux_sel = (state == DRAIN_RUN);

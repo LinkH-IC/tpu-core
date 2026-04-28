@@ -77,6 +77,18 @@ module top #(
     logic [ROWS-1:0][DATA_W-1:0]    bstep_result;
     logic [ROWS-1:0][DATA_W-1:0]    act_out;          // Selected activation output
 
+    // ── Pipeline Registers — Drain Path (R1, R2) ─────────────
+    logic [ROWS-1:0][ACC_W-1:0]     biased_reg;     // R1: post-bias_add
+    logic [ROWS-1:0][DATA_W-1:0]    act_reg;        // R2: post-activation
+
+    // ── Drain Pipeline Aligners — valid + col_idx ────────────
+    logic                           acc_valid_q1, acc_valid_q2;
+    logic [$clog2(COLS)-1:0]        acc_col_idx_q1, acc_col_idx_q2;
+
+    // ── Drain-done Delay Line (2 cycles to match data) ───────
+    logic                           acc_drain_done_raw;
+    logic                           drain_done_q1;
+
     // ── Internal Wires — FSM Handshake ───────────────────────
     logic        fsm_mux_sel;
     logic        fsm_wb_load_trigger;
@@ -95,14 +107,49 @@ module top #(
     logic [ROWS-1:0][DATA_W-1:0]    ub_mux_wr_data;
     logic                           ub_mux_wr_en;
 
+    // ── Drain Pipeline Registers ─────────────────────────────
+    //   R1: biased_reg     (acc_out → bias_add → R1)
+    //   R2: act_reg        (R1 → activation → R2)
+    //   acc_valid + acc_col_idx pipelined alongside the data
+    //   drain_done delayed 2 cycles so FSM holds mux_sel until
+    //   the final R2 write lands in unified_buffer.
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            biased_reg          <= '0;
+            act_reg             <= '0;
+
+            acc_valid_q1        <= 1'b0;
+            acc_valid_q2        <= 1'b0;
+
+            acc_col_idx_q1      <= '0;
+            acc_col_idx_q2      <= '0;
+
+            drain_done_q1       <= 1'b0;
+            fsm_acc_drain_done  <= 1'b0;
+        end
+        else begin
+            biased_reg          <= biased_out;
+            act_reg             <= act_out;
+
+            acc_valid_q1        <= acc_valid;
+            acc_valid_q2        <= acc_valid_q1;
+
+            acc_col_idx_q1      <= acc_col_idx;
+            acc_col_idx_q2      <= acc_col_idx_q1;
+
+            drain_done_q1       <= acc_drain_done_raw;
+            fsm_acc_drain_done  <= drain_done_q1;
+        end
+    end
+
     // ── Write Port Mux ───────────────────────────────────────
     //   mux_sel = 0: HOST drives unified buffer write port
     //   mux_sel = 1: Accumulator drain drives through ReLU
     always_comb begin
         if (fsm_mux_sel) begin
-            ub_mux_wr_addr = acc_col_idx;
-            ub_mux_wr_data = act_out;
-            ub_mux_wr_en   = acc_valid;
+            ub_mux_wr_addr = acc_col_idx_q2;
+            ub_mux_wr_data = act_reg;
+            ub_mux_wr_en   = acc_valid_q2;
         end else begin
             ub_mux_wr_addr = ub_wr_addr;
             ub_mux_wr_data = ub_wr_data;
@@ -184,7 +231,7 @@ module top #(
         .col_idx       (acc_col_idx),
         .acc_valid     (acc_valid),
         .pass_done     (fsm_acc_pass_done),
-        .drain_done    (fsm_acc_drain_done)
+        .drain_done    (acc_drain_done_raw)
     );
  
     // ── Bias Addition ──────────────────────────────────────────
@@ -209,7 +256,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_relu (
-        .data_in      (biased_out),
+        .data_in      (biased_reg),
         .shift_amount (shift_amount),
         .data_out     (relu_result)
     );
@@ -219,7 +266,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_leaky_relu (
-        .data_in      (biased_out),
+        .data_in      (biased_reg),
         .shift_amount (shift_amount),
         .leak_shift   (leak_shift),
         .data_out     (leaky_result)
@@ -230,7 +277,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_bypass (
-        .data_in      (biased_out),
+        .data_in      (biased_reg),
         .shift_amount (shift_amount),
         .data_out     (bypass_result)
     );
@@ -240,7 +287,7 @@ module top #(
         .ACC_W  (ACC_W),
         .DATA_W (DATA_W)
     ) u_binary_step (
-        .data_in      (biased_out),
+        .data_in      (biased_reg),
         .data_out     (bstep_result)
     );
 

@@ -14,7 +14,7 @@ TOPLEVEL = top
 MODULE   = tb_iris
 
 # Verilator flags
-EXTRA_ARGS += --timing -Wall -Wno-fatal --trace
+EXTRA_ARGS += --timing -Wall -Wno-fatal --trace --trace-structs
 EXTRA_ARGS += -I../../rtl
 
 include $(shell cocotb-config --makefiles)/Makefile.sim

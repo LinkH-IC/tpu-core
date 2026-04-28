@@ -14,7 +14,7 @@ TOPLEVEL = unified_buffer
 MODULE   = tb_unified_buffer
 
 # Verilator flags
-EXTRA_ARGS += --timing --trace -Wall -Wno-DECLFILENAME
+EXTRA_ARGS += --timing --trace -Wall --trace-structs
 
 include $(shell cocotb-config --makefiles)/Makefile.sim
 

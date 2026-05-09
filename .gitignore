@@ -1,4 +1,4 @@
-*.md
+Notes*
 /docs/*.npz
 
 **/__pycache__/
